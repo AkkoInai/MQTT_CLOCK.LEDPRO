@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""
+mqtt_led_publisher.py
+----------------------
+文字列(日本語含む)をラスタライズして、LEDマトリクス表示用のペイロードを
+MQTTにpublishするツール。実機(ESP32-LEDPRO)側と同じペイロード形式を使う。
+
+ペイロード形式(実機・PC共通):
+  [flag: uint8][width: uint16 big-endian][height: uint16 big-endian][RGB565 raw data...]
+  flag: 0=単発 / 1=分割の最初(新規) / 2=分割の途中(継ぎ足し) / 3=分割の最後(継ぎ足し+完成)
+  RGB565データは 行優先(左上から右下へ)、1pxあたり2byte。
+  --max-payload-bytesを超える場合は自動的に列(px)単位で分割し、連続送信する。
+
+使い方:
+  python3 mqtt_led_publisher.py "こんにちは、今日は晴れです" \
+      --host localhost --topic ledmatrix/display
+
+依存:
+  pip install paho-mqtt pillow
+"""
+import argparse
+import struct
+import sys
+import time
+
+from PIL import Image, ImageDraw, ImageFont
+
+try:
+    import paho.mqtt.client as mqtt
+except ImportError:
+    mqtt = None
+
+
+# 代表的な日本語フォントの候補パス(環境によって異なるので --font で上書き可能)
+# IPAex/IPA/Takao/Noto の順で優先(LED表示ではゴシック系が見やすいためゴシックを優先)
+DEFAULT_FONT_CANDIDATES = [
+    "/usr/share/fonts/opentype/ipaexfont-gothic/ipaexg.ttf",
+    "/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf",
+    "/usr/share/fonts/truetype/takao-gothic/TakaoPGothic.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansMonoCJK-Regular.ttc",
+]
+
+
+def find_default_font():
+    for path in DEFAULT_FONT_CANDIDATES:
+        try:
+            ImageFont.truetype(path, 16)
+            return path
+        except OSError:
+            continue
+    return None
+
+
+def fit_font_size(font_path, target_ink_height):
+    """
+    指定した高さに実際の文字の黒インク部分がフィットするフォントサイズを逆算する。
+    CJKフォントはフォントサイズ指定値と実際の見た目の高さがずれる(内部の余白の
+    せいで指定値より小さく見える)ことが多いため、代表的な文字で実測して補正する。
+    """
+    test_size = max(4, target_ink_height)
+    font = ImageFont.truetype(font_path, test_size)
+    tmp = Image.new("L", (10, 10))
+    d = ImageDraw.Draw(tmp)
+    bbox = d.textbbox((0, 0), "国あ0", font=font)  # 漢字・かな・数字を代表させて計測
+    ink_h = bbox[3] - bbox[1]
+    if ink_h <= 0:
+        return test_size
+    scale = target_ink_height / ink_h
+    return max(1, int(test_size * scale))
+
+
+def draw_hinomaru(height=16):
+    """日の丸(日章旗)のアイコンをPIL Imageとして描く。白地に赤丸、JIS規格に近い比率。"""
+    width = int(height * 1.5)  # 国旗の縦横比(2:3)
+    img = Image.new("RGB", (width, height), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    circle_d = int(height * 0.6)  # 赤丸の直径は旗の縦の3/5(JIS規格相当)
+    cx, cy = width / 2, height / 2
+    r = circle_d / 2
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(188, 0, 45))
+    return img
+
+
+# 文字列中にこの絵文字が現れたら、対応する関数で描いたアイコンに差し替える。
+# 今後、天気マークなどを増やす場合はここにエントリを追加するだけでよい。
+ICON_MAP = {
+    "🎌": draw_hinomaru,
+}
+
+
+def split_into_segments(text):
+    """textをICON_MAPのマーカーとそれ以外のテキスト片に分割する。
+    戻り値は [("text", str), ...] と [("icon", draw_fn), ...] が混在したリスト。"""
+    segments = []
+    buf = ""
+    i = 0
+    while i < len(text):
+        matched = False
+        for marker, draw_fn in ICON_MAP.items():
+            if text.startswith(marker, i):
+                if buf:
+                    segments.append(("text", buf))
+                    buf = ""
+                segments.append(("icon", draw_fn))
+                i += len(marker)
+                matched = True
+                break
+        if not matched:
+            buf += text[i]
+            i += 1
+    if buf:
+        segments.append(("text", buf))
+    return segments
+
+
+def rgb888_image_to_rgb565_bytes(img):
+    """PIL の RGB Image を RGB565 big-endian の bytes に変換する"""
+    raw = img.tobytes("raw", "RGB")  # R,G,B,R,G,B,...
+    out = bytearray(len(raw) // 3 * 2)
+    out_idx = 0
+    for i in range(0, len(raw), 3):
+        r, g, b = raw[i], raw[i + 1], raw[i + 2]
+        v = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+        out[out_idx] = (v >> 8) & 0xFF
+        out[out_idx + 1] = v & 0xFF
+        out_idx += 2
+    return bytes(out)
+
+
+def measure_text_tight(draw, text, font, char_spacing):
+    """1文字ずつの幅(font.getlength)を積み上げて、字間隔調整後の全体幅を計算する"""
+    total = 0.0
+    for ch in text:
+        total += draw.textlength(ch, font=font) + char_spacing
+    if text:
+        total -= char_spacing  # 最後の文字の後ろの間隔は含めない
+    return max(0, total)
+
+
+def draw_text_tight(draw, x, y, text, font, fill, char_spacing):
+    """1文字ずつ描画し、文字間隔をchar_spacing(負の値で詰める)だけ調整する"""
+    cx = x
+    for ch in text:
+        draw.text((cx, y), ch, font=font, fill=fill)
+        cx += draw.textlength(ch, font=font) + char_spacing
+    return cx
+
+
+def render_text_to_rgb565(text, panel_height=32, font_path=None, font_size=None,
+                           fg_color=(255, 255, 255), bg_color=(0, 0, 0), margin=2,
+                           icon_gap=3, char_spacing=-1):
+    """
+    文字列を高さ panel_height の1行ビットマップにラスタライズし、
+    (width, height, rgb565_bytes) を返す。
+    幅はテキスト量に応じて可変(=スクロール用の全体画像)。
+    text 中に ICON_MAP に登録された絵文字(例: 🎌)が現れると、その位置に
+    対応するアイコン画像を差し込んで描画する。
+    char_spacing: 文字ごとの追加間隔(px)。負の値でフォント本来の字送りより詰める。
+    """
+    if font_path is None:
+        font_path = find_default_font()
+    if font_path is None:
+        raise RuntimeError(
+            "日本語フォントが見つかりません。--font でフォントファイルのパスを指定してください。"
+        )
+    if font_size is None:
+        target_ink_height = panel_height - margin * 2
+        font_size = fit_font_size(font_path, target_ink_height)
+
+    font = ImageFont.truetype(font_path, font_size)
+    height = panel_height
+    icon_h = panel_height - margin * 2
+
+    tmp_img = Image.new("RGB", (10, 10), bg_color)
+    tmp_draw = ImageDraw.Draw(tmp_img)
+
+    segments = split_into_segments(text)
+
+    # 1周目: 各セグメントの幅を計算し、必要なら画像も先に作っておく
+    prepared = []  # [("text", str, w)] or [("icon", PIL.Image, w)]
+    total_w = 0
+    for kind, value in segments:
+        if kind == "text":
+            w = measure_text_tight(tmp_draw, value, font, char_spacing)
+            prepared.append(("text", value, w))
+        else:  # icon
+            icon_img = value(height=icon_h)
+            ratio = icon_img.width / icon_img.height
+            w = max(1, int(icon_h * ratio))
+            icon_resized = icon_img.resize((w, icon_h), Image.NEAREST)
+            prepared.append(("icon", icon_resized, w))
+        total_w += w + icon_gap
+    if prepared:
+        total_w -= icon_gap  # 最後の要素の後ろの隙間は不要
+
+    width = max(1, int(total_w) + margin * 2)
+    img = Image.new("RGB", (width, height), bg_color)
+    draw = ImageDraw.Draw(img)
+
+    # 全体の縦位置合わせ用に、代表的な文字でインクの高さを測る
+    ref_bbox = draw.textbbox((0, 0), "国Ag", font=font)
+    text_h = ref_bbox[3] - ref_bbox[1]
+    text_y = (height - text_h) // 2 - ref_bbox[1]
+
+    # 2周目: 実際にキャンバスへ描画
+    x = margin
+    for item in prepared:
+        if item[0] == "text":
+            _, value, w = item
+            draw_text_tight(draw, x, text_y, value, font, fg_color, char_spacing)
+        else:
+            _, icon_resized, w = item
+            icon_y = (height - icon_resized.height) // 2
+            img.paste(icon_resized, (int(x), icon_y))
+        x += w + icon_gap
+
+    data = rgb888_image_to_rgb565_bytes(img)
+    return width, height, data
+
+
+def pack_chunk_payload(flag, width, height, rgb565_data):
+    """flag: 0=単発 / 1=分割の最初 / 2=分割の途中 / 3=分割の最後"""
+    header = struct.pack(">BHH", flag, width, height)
+    return header + rgb565_data
+
+
+def slice_rgb565_columns(data, width, height, x_start, x_count):
+    """RGB565生データ(行優先, 2byte/px)から列範囲[x_start, x_start+x_count)を切り出す"""
+    out = bytearray(x_count * height * 2)
+    row_stride = width * 2
+    out_stride = x_count * 2
+    for y in range(height):
+        src_off = y * row_stride + x_start * 2
+        dst_off = y * out_stride
+        out[dst_off:dst_off + out_stride] = data[src_off:src_off + out_stride]
+    return bytes(out)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="LEDマトリクス表示用テキストをMQTTにpublish")
+    parser.add_argument("text", help="表示したい文字列(日本語可)")
+    parser.add_argument("--host", default="192.168.0.252", help="MQTTブローカーのホスト")
+    parser.add_argument("--port", type=int, default=1883, help="MQTTブローカーのポート")
+    parser.add_argument("--topic", default="ledmatrix/display", help="publish先トピック")
+    parser.add_argument("--height", type=int, default=24,
+                         help="パネルの高さ(px)。固定表示の時計帯(8px)を除いた"
+                              "スクロール帯の高さに合わせ、既定値は24")
+    parser.add_argument("--font", default=None, help="フォントファイルのパス")
+    parser.add_argument("--font-size", type=int, default=None, help="フォントサイズ(px)")
+    parser.add_argument("--fg", default="255,255,255", help="文字色 R,G,B")
+    parser.add_argument("--bg", default="0,0,0", help="背景色 R,G,B")
+    parser.add_argument("--char-spacing", type=int, default=-1,
+                         help="文字ごとの追加間隔(px)。負の値でフォント本来より詰める(既定-1)")
+    parser.add_argument("--dry-run", action="store_true",
+                         help="MQTT送信せず、生成したペイロードのサイズだけ表示")
+    parser.add_argument("--max-payload-bytes", type=int, default=60000,
+                         help="この値を超える場合は自動的に分割送信する(単発メッセージの安全上限)")
+    parser.add_argument("--chunk-width", type=int, default=600,
+                         help="分割送信時、1断片あたりの幅(px)")
+    parser.add_argument("--chunk-delay", type=float, default=0.3,
+                         help="分割送信時、断片間のsleep秒数(実機の受信・継ぎ足し処理に余裕を持たせる)")
+    parser.add_argument("--max-total-width", type=int, default=1500,
+                         help="実機側の合計幅上限(MAX_FRAME_WIDTH)に合わせる。超える場合は警告して中止")
+    args = parser.parse_args()
+
+    fg = tuple(int(v) for v in args.fg.split(","))
+    bg = tuple(int(v) for v in args.bg.split(","))
+
+    width, height, data = render_text_to_rgb565(
+        args.text, panel_height=args.height, font_path=args.font,
+        font_size=args.font_size, fg_color=fg, bg_color=bg,
+        char_spacing=args.char_spacing,
+    )
+    single_payload = pack_chunk_payload(0, width, height, data)
+    print(f"生成完了: width={width} height={height} payload_bytes={len(single_payload)}")
+
+    if width > args.max_total_width:
+        print(
+            f"エラー: 全体の幅が実機側の合計幅上限を超えます"
+            f"(width={width}px > 上限{args.max_total_width}px)。"
+            f"文字数を減らすか、実機側のMAX_FRAME_WIDTHを見直してください。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if args.dry_run:
+        return
+
+    if mqtt is None:
+        print("paho-mqtt がインストールされていません: pip install paho-mqtt", file=sys.stderr)
+        sys.exit(1)
+
+    client = mqtt.Client()
+    client.connect(args.host, args.port, keepalive=10)
+    client.loop_start()
+
+    def publish_payload(payload):
+        info = client.publish(args.topic, payload, qos=1)
+        info.wait_for_publish()
+
+    if len(single_payload) <= args.max_payload_bytes:
+        # 単発で収まる(flag=0)
+        publish_payload(single_payload)
+        print(f"publish完了(単発): topic={args.topic} host={args.host}:{args.port}")
+    else:
+        # 収まらないので、列(px)単位で自動分割して連続送信
+        n_chunks = (width + args.chunk_width - 1) // args.chunk_width
+        print(f"分割送信します: 全幅{width}px を {n_chunks}断片(1断片あたり最大{args.chunk_width}px)に分割")
+        for i in range(n_chunks):
+            x_start = i * args.chunk_width
+            x_count = min(args.chunk_width, width - x_start)
+            chunk_data = slice_rgb565_columns(data, width, height, x_start, x_count)
+            if i == 0:
+                flag = 1
+            elif i == n_chunks - 1:
+                flag = 3
+            else:
+                flag = 2
+            payload = pack_chunk_payload(flag, x_count, height, chunk_data)
+            publish_payload(payload)
+            print(f"  断片{i + 1}/{n_chunks} 送信完了: flag={flag} width={x_count}px "
+                  f"payload_bytes={len(payload)}")
+            if i < n_chunks - 1:
+                time.sleep(args.chunk_delay)
+        print(f"publish完了(分割): topic={args.topic} host={args.host}:{args.port}")
+
+    client.loop_stop()
+    client.disconnect()
+
+
+if __name__ == "__main__":
+    main()

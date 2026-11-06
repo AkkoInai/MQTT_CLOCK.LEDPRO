@@ -1,0 +1,97 @@
+import sys, pygame
+
+# --- すべてRGB565（16ビットカラー）に厳格に準拠した職人パレット ---
+BG_COLOR = (32, 16, 48)        # 16bit環境で最も深く美しく発色する「深い紫」の夜空
+DEEP_RED = (128, 0, 32)        # 火の薪の燻り、および太陽の下辺を焦がす赤黒い大気の色
+ICE_WHITE = (224, 240, 255)    # 水（💧）のひんやり感を演出する、青みのある白
+
+# --- 月曜日（🌙）のための16bit明度グラデーションパレット ---
+MON_YEL_1 = (255, 255, 200)    # 1: 最も明るい黄色（まばゆい発光の芯）
+MON_YEL_2 = (255, 215, 0)      # 2: 通常の黄色
+MON_YEL_3 = (200, 160, 0)      # 3: くすんだ黄色（中間色）
+MON_YEL_4 = (128, 96, 0)       # 4: 最も暗い黄色（宇宙の闇に溶け込む影）
+MON_YEL_5 = (80, 60, 0)        # 5: あなたのデータにある「5」のための超暗色（境界のボカシ）
+
+WHITE = (255, 255, 255)
+GRAY = (80, 80, 80)
+L_YEL, YEL, ORG_SHD = (255, 255, 200), (255, 215, 0), (128, 64, 0)
+YEL_FLM, RED = (255, 220, 0), (255, 32, 0)
+SKY, AQUA, BLU_SHD = (128, 224, 255), (0, 160, 220), (0, 64, 160)
+L_GRN, GRN, D_GRN, BRN, SKIN = (160, 240, 0), (0, 192, 64), (0, 80, 32), (128, 80, 32), (200, 160, 110)
+GLD, MID_YEL, BRZ = (255, 215, 0), (200, 160, 0), (128, 96, 0)
+SUN_RED, SAT_BLU = (255, 32, 32), (32, 112, 255)
+EBICHA = (100, 30, 40)         # 太陽（☀️）を自然に馴染ませる、朝焼けの伝統的な「海老茶色」
+
+# 8x8pxをフルに使った文字列展開（AIの自動要約バグを完全に封殺）
+
+# 月 (🌙: 本家からあなたが読み解いた、明度1〜4（および5）を使った真の立体グラデーションデータ、全64文字＝8行)
+STR_MON = "00000040" + "00000034" + "00000021" + "00000311" + "45432323" + "11111214" + "03122140" + "00423400"
+
+# 火 (🔥: 【永久凍結】絶対に触らない、完成度最高のあの大火力・薪の炎ドット、全48文字＝6行)
+STR_TUE = "00020000" + "00323000" + "03212300" + "03222300" + "32242230" + "03333300"
+
+# 水 (💧: 【永久凍結】お気に入りいただいた、あのかき氷のひんやりした結晶感の極上水滴ドット、全48文字＝6行)
+STR_WED = "00010000" + "00014000" + "00132400" + "00231400" + "01233340" + "00444400"
+
+# 木 (🌳: 【永久凍結】絶対不動の最高傑作バランス、全48文字＝6行)
+STR_THU = "00122300" + "01223330" + "02223330" + "00045000" + "00034000" + "00033000"
+
+# 金 (🪙: 高級ゴールドカード仕様の大判コイン、全48文字＝6行)
+STR_FRI = "00333300" + "03121220" + "03222220" + "00222220" + "00222220" + "00000000"
+
+# 土 (🪐: 空間の奥行き。手前の輪と奥の重なり、天体の球体感、全48文字＝6行)
+STR_SAT = "00033000" + "02222200" + "11222211" + "00222200" + "00033000" + "00000000"
+
+# 日 (☀️: 自然な夜明け。EBICHAを最下部に仕込み、強烈な光源と大気を無理なく馴染ませる、全48文字＝6行)
+STR_SUN = "00000000" + "00333300" + "03322330" + "03211230" + "21111112" + "41414141"
+
+def parse_str_to_pixels(data_str):
+    """文字列の長さ（48文字か64文字か）から自動的に行数を計算して2次元配列化する（大バグ完全修正）"""
+    total_chars = len(data_str)
+    num_rows = total_chars // 8  # 8文字（横8px）ごとに1行として計算
+    pixels = []
+    for r in range(num_rows):
+        row = []
+        for c in range(8):
+            row.append(int(data_str[r * 8 + c]))
+        pixels.append(row)
+    return pixels
+
+ICONS = {
+    0: {"palette": [BG_COLOR, MON_YEL_1, MON_YEL_2, MON_YEL_3, MON_YEL_4, MON_YEL_5], "pixels": parse_str_to_pixels(STR_MON), "width": 8, "y_offset": 0}, # 月曜日は8行フルに使うので y_offset=0
+    1: {"palette": [BG_COLOR, YEL_FLM, RED, DEEP_RED, WHITE], "pixels": parse_str_to_pixels(STR_TUE), "width": 8, "y_offset": 1}, # 他の6行アイコンは上下中央寄せ（y_offset=1）を維持
+    2: {"palette": [BG_COLOR, ICE_WHITE, SKY, AQUA, BLU_SHD], "pixels": parse_str_to_pixels(STR_WED), "width": 8, "y_offset": 1},
+    3: {"palette": [BG_COLOR, L_GRN, GRN, D_GRN, BRN, SKIN], "pixels": parse_str_to_pixels(STR_THU), "width": 8, "y_offset": 1},
+    4: {"palette": [BG_COLOR, WHITE, GLD, MID_YEL, BRZ], "pixels": parse_str_to_pixels(STR_FRI), "width": 8, "y_offset": 1},
+    5: {"palette": [BG_COLOR, WHITE, SAT_BLU, GRAY], "pixels": parse_str_to_pixels(STR_SAT), "width": 8, "y_offset": 1},
+    6: {"palette": [BG_COLOR, WHITE, SUN_RED, GRAY, EBICHA], "pixels": parse_str_to_pixels(STR_SUN), "width": 8, "y_offset": 1}
+}
+
+def main():
+    pygame.init()
+    SCALE, V_WIDTH, V_HEIGHT = 4, 56, 8
+    virtual_screen = pygame.Surface((V_WIDTH, V_HEIGHT))
+    display_screen = pygame.display.set_mode((V_WIDTH * SCALE, V_HEIGHT * SCALE))
+    pygame.display.set_caption("Icon Dot-Art Studio (Mon-Sun)")
+    clock = pygame.time.Clock()
+
+    while True:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT: pygame.quit(); sys.exit()
+        virtual_screen.fill(BG_COLOR)
+        
+        current_x = 0
+        for i in range(7):
+            icon_data = ICONS[i]
+            y_off = icon_data["y_offset"] # 曜日ごとの行数に応じた正しい配置オフセットを取得
+            for r, row in enumerate(icon_data["pixels"]):
+                for c, p_val in enumerate(row):
+                    if p_val > 0:
+                        virtual_screen.set_at((current_x + c, r + y_off), icon_data["palette"][p_val])
+            current_x += icon_data["width"]
+
+        pygame.transform.scale(virtual_screen, (V_WIDTH * SCALE, V_HEIGHT * SCALE), display_screen)
+        pygame.display.flip()
+        clock.tick(10)
+
+if __name__ == "__main__": main()

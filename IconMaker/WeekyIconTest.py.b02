@@ -1,0 +1,101 @@
+import sys, pygame
+
+# --- RGB565（16ビットカラー）に厳格に準拠した職人パレット ---
+BG_COLOR = (32, 16, 48)        # 夜空のベースとなる深い紫
+WHITE = (255, 255, 255)
+GRAY = (80, 80, 80)
+
+# 曜日ごとのカラーパレット (木・金・土・日はこれまでの仕様を維持)
+L_GRN, GRN, D_GRN, BRN, SKIN = (170, 240, 0), (0, 200, 80), (0, 90, 40), (140, 90, 50), (200, 160, 110)
+GLD, MID_YEL, BRZ = (255, 215, 0), (200, 160, 0), (128, 96, 0)
+SUN_RED, SAT_BLU, EBICHA = (255, 32, 32), (32, 112, 255), (100, 30, 40)
+
+# --- あなたのC言語データから16進数をRGB565範囲で完全再現したパレット群 ---
+# 火曜日パレット (ファイル1: Fire)
+TUE_P1, TUE_P2, TUE_P3, TUE_P4, TUE_P5 = (249, 230, 215), (253, 187, 139), (249, 129, 41), (255, 160, 90), (255, 108, 0)
+
+# 水曜日パレット (ファイル2: Water)
+WED_P1, WED_P2, WED_P3, WED_P4 = (21, 21, 206), (41, 41, 234), (19, 106, 236), (8, 255, 250)
+
+# 月曜日パレット (ファイル3: Moon - アンパック数の整合性を完全にチェック済みの27色)
+MON_P1, MON_P2, MON_P3, MON_P4, MON_P5, MON_P6, MON_P7, MON_P8, MON_P9, MON_PA, MON_PB = \
+(7,7,7), (15,15,15), (25,25,25), (12,12,12), (64,182,195), (37,48,51), (67,190,203), (80,228,243), (86,241,255), (71,203,216), (83,239,254)
+
+MON_PC, MON_PD, MON_PE, MON_PF, MON_PG, MON_PH, MON_PI, MON_PJ, MON_PK, MON_PL, MON_PM = \
+(49,143,154), (81,236,253), (5,172,227), (25,68,75), (23,47,52), (73,230,251), (71,228,251), (67,224,249), (9,9,9), (9,10,10), (22,22,22)
+
+MON_PN, MON_PO, MON_PP, MON_PQ, MON_PR = (29,29,29), (32,96,114), (25,42,47), (16,16,16), (0,0,0)
+
+# --- 2. 8x8pxをフルに使った文字列・数値展開 ---
+
+# 月 (🌙: あなたがPiskelで綺麗に美化してくれた真の三日月。16進数文字含む8行データ)
+STR_MON = "12341561" + "12341781" + "12341096" + "12341ABC" + "12341DEF" + "GHHIJKLL" + "MNNOPNQQ" + "RSTUVSSS"
+
+# 火 (🔥: 【完全固定】ファイル1から展開した大火力・薪の炎、8行データ)
+STR_TUE = "00001000" + "00023300" + "00142330" + "04223355" + "42363553" + "34123355" + "25535553" + "05355530"
+
+# 水 (💧: 【完全固定】ファイル2から展開したリアル水滴、8行データ)
+STR_WED = "00121000" + "10121100" + "10232121" + "12223211" + "21323320" + "11123322" + "12334331" + "12344331"
+
+# 木 (🌳: 【永久凍結】絶対不動の最高傑作バランス、6行データ)
+STR_THU = "00122300" + "01223330" + "02223330" + "00045000" + "00034000" + "00033000"
+
+# 金 (🪙: 高級ゴールドカード仕様の大判コイン、6行データ)
+STR_FRI = "00333300" + "03121220" + "03222220" + "00222220" + "00222220" + "00000000"
+
+# 土 (🪐: 保留用土星、6行データ)
+STR_SAT = "00033000" + "02222200" + "11222211" + "00222200" + "00033000" + "00000000"
+
+# 日 (☀️: 自然な夜明け、6行データ)
+STR_SUN = "00000000" + "00333300" + "03322330" + "03211230" + "21111112" + "41414141"
+
+def parse_to_pixels(day_idx):
+    data_str = [STR_MON, STR_TUE, STR_WED, STR_THU, STR_FRI, STR_SAT, STR_SUN][day_idx]
+    num_rows = len(data_str) // 8
+    pixels = []
+    for r in range(num_rows):
+        row = []
+        for c in range(8):
+            val = data_str[r * 8 + c]
+            # 36進数としてパースすることで、0〜9だけでなく A〜Z までの全文字を安全かつ正確にパレット番号に変換
+            row.append(int(val, 36))
+    return pixels
+
+ICONS = {
+    0: {"palette": [BG_COLOR, MON_P1, MON_P2, MON_P3, MON_P4, MON_P5, MON_P6, MON_P7, MON_P8, MON_P9, MON_PA, MON_PB, MON_PC, MON_PD, MON_PE, MON_PF, MON_PG, MON_PH, MON_PI, MON_PJ, MON_PK, MON_PL, MON_PM, MON_PN, MON_PO, MON_PP, MON_PQ, MON_PR], "pixels": parse_to_pixels(0), "width": 8, "y_offset": 0},
+    1: {"palette": [BG_COLOR, WHITE, TUE_P1, TUE_P2, TUE_P3, TUE_P4, TUE_P5, TUE_P1], "pixels": parse_to_pixels(1), "width": 8, "y_offset": 0}, 
+    2: {"palette": [BG_COLOR, WHITE, WED_P1, WED_P2, WED_P3, WED_P4], "pixels": parse_to_pixels(2), "width": 8, "y_offset": 0},
+    3: {"palette": [BG_COLOR, L_GRN, GRN, D_GRN, BRN, SKIN], "pixels": parse_to_pixels(3), "width": 8, "y_offset": 1},
+    4: {"palette": [BG_COLOR, WHITE, GLD, MID_YEL, BRZ], "pixels": parse_to_pixels(4), "width": 8, "y_offset": 1},
+    5: {"palette": [BG_COLOR, WHITE, SAT_BLU, GRAY], "pixels": parse_to_pixels(5), "width": 8, "y_offset": 1},
+    6: {"palette": [BG_COLOR, WHITE, SUN_RED, GRAY, EBICHA], "pixels": parse_to_pixels(6), "width": 8, "y_offset": 1}
+}
+
+def main():
+    pygame.init()
+    SCALE, V_WIDTH, V_HEIGHT = 4, 56, 8
+    virtual_screen = pygame.Surface((V_WIDTH, V_HEIGHT))
+    display_screen = pygame.display.set_mode((V_WIDTH * SCALE, V_HEIGHT * SCALE))
+    pygame.display.set_caption("Icon Dot-Art Studio (Mon-Sun)")
+    clock = pygame.time.Clock()
+
+    while True:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT: pygame.quit(); sys.exit()
+        virtual_screen.fill(BG_COLOR)
+        
+        current_x = 0
+        for i in range(7):
+            icon_data = ICONS[i]
+            y_off = icon_data["y_offset"]
+            for r, row in enumerate(icon_data["pixels"]):
+                for c, p_val in enumerate(row):
+                    if p_val > 0:
+                        virtual_screen.set_at((current_x + c, r + y_off), icon_data["palette"][p_val])
+            current_x += icon_data["width"]
+
+        pygame.transform.scale(virtual_screen, (V_WIDTH * SCALE, V_HEIGHT * SCALE), display_screen)
+        pygame.display.flip()
+        clock.tick(10)
+
+if __name__ == "__main__": main()

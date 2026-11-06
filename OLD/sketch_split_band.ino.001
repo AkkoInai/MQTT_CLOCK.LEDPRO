@@ -1,0 +1,349 @@
+// sketch_split_band.ino
+// -----------------------------------------------------------------
+// 上段: 常時表示の時計(NTP同期、内部完結、通信不要)
+// 下段: MQTTで届いたビットマップを独立して表示/スクロール
+// 状態遷移(CLOCK⇄SCROLL)を廃止し、2つの帯を毎ループ独立に描画する。
+//
+// トピック:
+//   ledmatrix/display (バイナリ) [width u16 BE][height u16 BE][RGB565 raw]
+//     → 届いたら即座にスクロール帯に表示開始(SHOWコマンド不要)
+//   ledmatrix/control (JSON)
+//     設定変更(いつでも送信可): {"scroll_speed":30,"repeat":2,"brightness":80,"weather_color":[r,g,b]}
+//     強制停止(スクロール帯を空にする): {"cmd":"stop"}
+//
+// 必要ライブラリ: PubSubClient, ArduinoJson, ESP32-HUB75-MatrixPanel-I2S-DMA
+// -----------------------------------------------------------------
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
+#include <Fonts/TomThumb.h>
+#include <time.h>
+
+// ---------- パネル設定(実機: 64x32を1枚接続) ----------
+#define RES_X 64
+#define RES_Y 32
+#define CHAIN 1
+
+// ---------- 帯の高さ配分 ----------
+#define CLOCK_BAND_HEIGHT 8                       // 時計帯(上段)の高さ
+#define SCROLL_BAND_Y     CLOCK_BAND_HEIGHT        // スクロール帯(下段)の開始y
+#define SCROLL_BAND_HEIGHT (RES_Y - CLOCK_BAND_HEIGHT)
+
+MatrixPanel_I2S_DMA *dma_display;
+
+// ---------- Wi-Fi / MQTT設定 ----------
+const char *ssid       = "Buffalo-1320";
+const char *password   = "hdpybe6nm3gxa";
+const char *mqtt_host  = "192.168.0.252";
+const uint16_t mqtt_port = 1883;
+const char *topic_frame   = "ledmatrix/display";
+const char *topic_control = "ledmatrix/control";
+
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+
+// ---------- フレームバッファ(スクロール帯用) ----------
+#define MAX_FRAME_WIDTH 900   // uint16_tバッファ上限(65535byte)から十分な余裕を確保
+uint8_t *frameBuf = nullptr;
+volatile uint16_t frameWidth  = 0;
+volatile uint16_t frameHeight = 0;
+volatile bool frameReady = false;
+bool scrollBandCleared = true;  // 空にした後、無駄な再描画をしないためのフラグ
+
+// ---------- スクロール表示パラメータ(いつでもcontrolで変更可) ----------
+volatile float scrollSpeedPxPerSec = 20.0f;
+volatile int   repeatTarget = 1;   // 0=無限ループ
+int   scrollCyclesDone = 0;
+float scrollOffset = 0.0f;
+
+volatile uint8_t brightnessLevel = 40;
+
+// ---------- 天気アイコン(仮:塗り四角、controlの"weather_color"で更新可能) ----------
+volatile uint8_t weatherR = 80, weatherG = 80, weatherB = 80;
+
+unsigned long lastMillis = 0;
+unsigned long lastClockDraw = 0;
+
+// =====================================================================
+// 文字列描画ヘルパー(数字・スラッシュ=3px詰め、コロンだけ4pxで可読性確保)
+// =====================================================================
+// =====================================================================
+// 文字列描画ヘルパー(数字・スラッシュ・コロン=3px詰め)
+// =====================================================================
+int drawCompact(int x, int y, const char *text, uint16_t color) {
+  dma_display->setTextColor(color);
+  int cx = x;
+  char buf[2] = {0, 0};
+  for (const char *p = text; *p; p++) {
+    buf[0] = *p;
+    int drawX = cx;
+    if (*p == ':') drawX += 1;  // コロンのグリフは左詰め定義のため、描画位置だけ1px右にずらして前後対称にする
+    dma_display->setCursor(drawX, y);
+    dma_display->print(buf);
+    cx += 3;
+  }
+  return cx;
+}
+
+// =====================================================================
+// フレームバッファ確保
+// =====================================================================
+void allocateFrameBuffer(uint16_t w, uint16_t h) {
+  if (frameBuf != nullptr) {
+    free(frameBuf);
+    frameBuf = nullptr;
+  }
+  frameBuf = (uint8_t *)malloc((size_t)w * h * 2);
+}
+
+// =====================================================================
+// 上段: 時計描画(時計帯のみクリアして再描画。スクロール帯には触れない)
+// =====================================================================
+void drawClock() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 100)) {
+    return;  // まだNTP同期できていない
+  }
+
+  // 曜日で色分け(平日=緑、土曜=青、日曜=赤)
+  uint16_t dateColor;
+  if (timeinfo.tm_wday == 0) {
+    dateColor = dma_display->color565(255, 60, 60);
+  } else if (timeinfo.tm_wday == 6) {
+    dateColor = dma_display->color565(80, 140, 255);
+  } else {
+    dateColor = dma_display->color565(60, 220, 60);
+  }
+
+  char dateBuf[9];
+  snprintf(dateBuf, sizeof(dateBuf), "%02d/%02d/%02d",
+           timeinfo.tm_year % 100, timeinfo.tm_mon + 1, timeinfo.tm_mday);
+  char timeBuf[9];
+  snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d",
+           timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+  static const char *wdayNames3[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+
+  // 時計帯だけをクリア(スクロール帯には手を出さない)
+  dma_display->fillRect(0, 0, RES_X, CLOCK_BAND_HEIGHT, 0);
+
+  dma_display->setFont(&TomThumb);
+  int cx = drawCompact(0, 5, dateBuf, dateColor);
+  cx = drawCompact(cx, 5, timeBuf, dma_display->color565(200, 200, 200));
+  drawCompact(cx, 5, wdayNames3[timeinfo.tm_wday], dateColor);
+  dma_display->setFont();  // 既定フォントに戻す
+}
+
+// =====================================================================
+// 下段: スクロール帯描画(毎ループ、時計とは無関係に独立して動く)
+// =====================================================================
+void drawScrollBand(float dt) {
+  if (!frameReady || frameWidth == 0) {
+    if (!scrollBandCleared) {
+      dma_display->fillRect(0, SCROLL_BAND_Y, RES_X, SCROLL_BAND_HEIGHT, 0);
+      scrollBandCleared = true;
+    }
+    return;
+  }
+  scrollBandCleared = false;
+
+  bool doScroll = (frameWidth > RES_X && scrollSpeedPxPerSec > 0);
+
+  if (doScroll) {
+    scrollOffset += scrollSpeedPxPerSec * dt;
+    if (scrollOffset >= frameWidth) {
+      scrollOffset -= frameWidth;
+      scrollCyclesDone++;
+      if (repeatTarget > 0 && scrollCyclesDone >= repeatTarget) {
+        Serial.println("scroll: 規定回数終了、メッセージ帯を空に");
+        frameReady = false;
+        dma_display->fillRect(0, SCROLL_BAND_Y, RES_X, SCROLL_BAND_HEIGHT, 0);
+        scrollBandCleared = true;
+        return;
+      }
+    }
+  } else {
+    scrollOffset = 0.0f;
+    // 静止表示(scroll_speed=0)は自動終了せず、stopコマンド待ち
+  }
+
+  int offset = (int)scrollOffset;
+  int drawHeight = (frameHeight < SCROLL_BAND_HEIGHT) ? frameHeight : SCROLL_BAND_HEIGHT;
+  bool isFinalCycle = (repeatTarget > 0 && scrollCyclesDone == repeatTarget - 1);
+
+  for (int py = 0; py < drawHeight; py++) {
+    for (int px = 0; px < RES_X; px++) {
+      int rawPos = offset + px;
+      if (isFinalCycle && rawPos >= frameWidth) {
+        dma_display->drawPixel(px, SCROLL_BAND_Y + py, 0);
+        continue;
+      }
+      int srcX = rawPos % frameWidth;
+      int idx = (py * frameWidth + srcX) * 2;
+      uint16_t color = (frameBuf[idx] << 8) | frameBuf[idx + 1];
+      dma_display->drawPixel(px, SCROLL_BAND_Y + py, color);
+    }
+  }
+}
+
+// =====================================================================
+// MQTT受信コールバック
+// =====================================================================
+void onMqttMessage(char *topic, byte *payload, unsigned int length) {
+  String t(topic);
+
+  if (t == topic_frame) {
+    // SHOWコマンド不要: 届いたら即座に表示する
+    if (length < 4) {
+      Serial.println("frame: ヘッダー不足");
+      return;
+    }
+    uint16_t w = (payload[0] << 8) | payload[1];
+    uint16_t h = (payload[2] << 8) | payload[3];
+
+    if (w == 0 || h == 0 || w > MAX_FRAME_WIDTH || h > SCROLL_BAND_HEIGHT) {
+      Serial.printf("frame: 不正なサイズ w=%u h=%u\n", w, h);
+      return;
+    }
+    size_t expected = (size_t)w * h * 2;
+    if ((size_t)(length - 4) < expected) {
+      Serial.println("frame: データ不足");
+      return;
+    }
+
+    allocateFrameBuffer(w, h);
+    if (frameBuf == nullptr) {
+      Serial.println("frame: メモリ確保失敗");
+      return;
+    }
+    memcpy(frameBuf, payload + 4, expected);
+    frameWidth  = w;
+    frameHeight = h;
+    scrollOffset = 0.0f;
+    scrollCyclesDone = 0;
+    lastMillis = millis();
+    frameReady = true;
+    Serial.printf("frame受信: w=%u h=%u / 空きヒープ=%lu byte\n", w, h, (unsigned long)ESP.getFreeHeap());
+
+  } else if (t == topic_control) {
+    JsonDocument doc;  // ArduinoJson 7: 容量固定は不要、通常のJsonDocumentを使う
+    DeserializationError err = deserializeJson(doc, payload, length);
+    if (err) {
+      Serial.print("control: JSONパース失敗 ");
+      Serial.println(err.c_str());
+      return;
+    }
+
+    if (doc["brightness"].is<int>()) {
+      brightnessLevel = (uint8_t)constrain((int)doc["brightness"], 0, 255);
+      dma_display->setBrightness8(brightnessLevel);
+      Serial.printf("control: brightness=%u\n", brightnessLevel);
+    }
+    if (doc["scroll_speed"].is<float>()) {
+      scrollSpeedPxPerSec = doc["scroll_speed"];
+      Serial.printf("control: scroll_speed=%.1f\n", scrollSpeedPxPerSec);
+    }
+    if (doc["repeat"].is<int>()) {
+      repeatTarget = doc["repeat"];
+      scrollCyclesDone = 0;
+      Serial.printf("control: repeat=%d\n", repeatTarget);
+    }
+    if (doc["weather_color"].is<JsonArray>()) {
+      JsonArray arr = doc["weather_color"];
+      if (arr.size() == 3) {
+        weatherR = constrain((int)arr[0], 0, 255);
+        weatherG = constrain((int)arr[1], 0, 255);
+        weatherB = constrain((int)arr[2], 0, 255);
+        Serial.printf("control: weather_color=(%u,%u,%u)\n", weatherR, weatherG, weatherB);
+      }
+    }
+
+    const char *cmd = doc["cmd"] | "";
+    if (strcmp(cmd, "stop") == 0) {
+      frameReady = false;
+      dma_display->fillRect(0, SCROLL_BAND_Y, RES_X, SCROLL_BAND_HEIGHT, 0);
+      scrollBandCleared = true;
+      Serial.println("control: stop受信、メッセージ帯を空に");
+    }
+  }
+}
+
+// =====================================================================
+// Wi-Fi / MQTT接続
+// =====================================================================
+void connectWiFi() {
+  WiFi.begin(ssid, password);
+  Serial.print("WiFi接続中");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println(" 接続完了: " + WiFi.localIP().toString());
+}
+
+void connectMqtt() {
+  while (!mqttClient.connected()) {
+    Serial.print("MQTT接続中...");
+    String clientId = "esp32-ledpro-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+    if (mqttClient.connect(clientId.c_str())) {
+      Serial.println("接続成功");
+      mqttClient.subscribe(topic_frame);
+      mqttClient.subscribe(topic_control);
+    } else {
+      Serial.printf("失敗 rc=%d / 5秒後に再試行\n", mqttClient.state());
+      delay(5000);
+    }
+  }
+}
+
+// =====================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("Started");
+
+  HUB75_I2S_CFG mxconfig(RES_X, RES_Y, CHAIN);
+  mxconfig.clkphase = false;
+
+  dma_display = new MatrixPanel_I2S_DMA(mxconfig);
+  dma_display->begin();
+  dma_display->setBrightness8(brightnessLevel);
+  dma_display->clearScreen();
+
+  connectWiFi();
+
+  // NTP同期(JST = UTC+9、サマータイムなし)
+  configTime(9 * 3600, 0, "ntp.nict.jp", "time.google.com");
+
+  mqttClient.setServer(mqtt_host, mqtt_port);
+  mqttClient.setCallback(onMqttMessage);
+  Serial.printf("MQTT接続前の空きヒープ=%lu byte\n", (unsigned long)ESP.getFreeHeap());
+  bool bufOk = mqttClient.setBufferSize(64100);  // uint16_t上限65535byte未満に収める
+  Serial.printf("setBufferSize結果=%s / 直後の空きヒープ=%lu byte\n",
+                bufOk ? "成功" : "失敗", (unsigned long)ESP.getFreeHeap());
+  connectMqtt();
+
+  lastMillis = millis();
+}
+
+// =====================================================================
+void loop() {
+  if (!mqttClient.connected()) {
+    connectMqtt();
+  }
+  mqttClient.loop();
+
+  unsigned long now = millis();
+
+  // 上段: 時計(1秒ごと)
+  if (now - lastClockDraw >= 1000) {
+    lastClockDraw = now;
+    drawClock();
+  }
+
+  // 下段: スクロール帯(毎ループ、時計とは無関係)
+  float dt = (now - lastMillis) / 1000.0f;
+  lastMillis = now;
+  drawScrollBand(dt);
+}

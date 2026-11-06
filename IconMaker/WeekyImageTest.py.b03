@@ -1,0 +1,81 @@
+import sys, pygame
+from datetime import datetime
+BG_COLOR, WHITE, GRAY = (0, 0, 0), (255, 255, 255), (80, 80, 80)
+L_YEL, YEL, ORG_SHD = (255, 255, 220), (255, 215, 0), (200, 100, 0)
+WHT, YEL_FLM, RED, BLU_FLM = (255, 255, 255), (255, 230, 0), (255, 50, 0), (0, 100, 255)
+WHT, SKY, AQUA, BLU_SHD = (255, 255, 255), (130, 240, 255), (0, 180, 220), (0, 90, 160)
+L_GRN, GRN, D_GRN, BRN, SKIN = (170, 240, 0), (0, 200, 80), (0, 90, 40), (140, 90, 50), (200, 160, 110)
+WHT, GLD, MID_YEL, BRZ = (255, 255, 255), (255, 220, 60), (210, 170, 0), (130, 90, 0)
+SUN_RED, SAT_BLU = (255, 51, 51), (41, 121, 255)
+
+ICONS = {
+    0: {"palette": [BG_COLOR, L_YEL, YEL, ORG_SHD], "pixels": [[0,0,0,0,2,2,2,0],[0,0,0,2,2,3,0,0],[0,0,0,2,3,0,0,0],[0,0,2,2,3,0,0,0],[0,0,2,2,2,0,0,0],[0,0,0,0,0,0,1,0]], "width": 8, "color": YEL},
+    1: {"palette": [BG_COLOR, WHT, YEL_FLM, RED, BLU_FLM], "pixels": [[0,0,0,2,2,3,0,0],[0,0,2,1,1,2,3,0],[0,3,2,1,1,2,3,0],[3,3,2,3,2,3,3,0],[0,3,4,0,0,0,3,0],[0,0,0,0,0,0,0,0]], "width": 8, "color": RED},
+    2: {"palette": [BG_COLOR, WHT, SKY, AQUA, BLU_SHD], "pixels": [[0,0,0,1,1,0,0,0],[0,0,1,2,2,3,0,0],[0,1,2,2,2,3,3,0],[0,3,2,2,3,3,4,0],[0,0,4,4,4,4,0,0],[0,0,0,0,0,0,0,0]], "width": 8, "color": AQUA},
+    3: {"palette": [BG_COLOR, L_GRN, GRN, D_GRN, BRN, SKIN], "pixels": [[0,0,1,2,2,3,0,0],[0,1,2,2,3,3,3,0],[0,2,2,2,3,3,3,0],[0,0,0,4,5,0,0,0],[0,0,0,3,4,0,0,0],[0,0,0,3,3,0,0,0]], "width": 8, "color": GRN},
+    4: {"palette": [BG_COLOR, WHT, GLD, MID_YEL, BRZ], "pixels": [[0,0,4,4,4,4,4,4,0,0],[0,4,2,2,2,2,2,2,3,0],[0,4,2,1,1,2,1,2,3,0],[0,4,2,2,2,2,2,2,3,0],[0,0,3,3,3,3,3,3,0,0],[0,0,0,0,0,0,0,0,0,0]], "width": 10, "color": GLD},
+    5: {"palette": [BG_COLOR, WHT, SAT_BLU, GRAY], "pixels": [[0,0,0,3,3,0,0,0],[0,2,2,2,2,2,0,0],[1,1,2,2,2,2,1,1],[0,0,2,2,2,2,0,0],[0,0,0,3,3,0,0,0],[0,0,0,0,0,0,0,0]], "width": 8, "color": SAT_BLU},
+    6: {"palette": [BG_COLOR, WHT, SUN_RED, GRAY], "pixels": [[0,0,0,2,0,0,0,0],[0,2,0,2,0,2,0,0],[0,0,2,2,2,0,0,0],[0,2,2,1,2,2,0,0],[0,0,2,2,2,0,0,0],[0,0,0,0,0,0,0,0]], "width": 8, "color": SUN_RED}
+}
+
+FONT = {
+    '0': [[0,1,1,1,0],[1,0,0,0,1],[1,0,0,1,1],[1,0,1,0,1],[1,1,0,0,1],[1,0,0,0,1],[0,1,1,1,0],[0,0,0,0,0]],
+    '1': [[0,0,1,0,0],[0,1,1,0,0],[0,0,1,0,0],[0,0,1,0,0],[0,0,1,0,0],[0,0,1,0,0],[0,1,1,1,0],[0,0,0,0,0]],
+    '2': [[0,1,1,1,0],[1,0,0,0,1],[0,0,0,0,1],[0,0,0,1,0],[0,0,1,0,0],[0,1,0,0,0],[1,1,1,1,1],[0,0,0,0,0]],
+    '3': [[0,1,1,1,0],[1,0,0,0,1],[0,0,0,0,1],[0,1,1,1,0],[0,0,0,0,1],[1,0,0,0,1],[0,1,1,1,0],[0,0,0,0,0]],
+    '4': [[0,1,0,1,0],[0,1,0,1,0],[1,0,0,1,0],[1,1,1,1,1],[0,0,0,1,0],[0,0,0,1,0],[0,0,0,1,0],[0,0,0,0,0]],
+    '5': [[1,1,1,1,1],[1,0,0,0,0],[1,1,1,1,0],[0,0,0,0,1],[0,0,0,0,1],[1,0,0,0,1],[0,1,1,1,0],[0,0,0,0,0]],
+    '6': [[0,1,1,1,0],[1,0,0,0,0],[1,1,1,1,0],[1,0,0,0,1],[1,0,0,0,1],[1,0,0,0,1],[0,1,1,1,0],[0,0,0,0,0]],
+    '7': [[1,1,1,1,1],[0,0,0,0,1],[0,0,0,1,0],[0,0,1,0,0],[0,0,1,0,0],[0,1,0,0,0],[0,1,0,0,0],[0,0,0,0,0]],
+    '8': [[0,1,1,1,0],[1,0,0,0,1],[1,0,0,0,1],[0,1,1,1,0],[1,0,0,0,1],[1,0,0,0,1],[0,1,1,1,0],[0,0,0,0,0]],
+    '9': [[0,1,1,1,0],[1,0,0,0,1],[1,0,0,0,1],[0,1,1,1,1],[0,0,0,0,1],[0,0,0,0,1],[0,1,1,1,0],[0,0,0,0,0]],
+    '/': [[0,0,0],[0,0,0],[0,0,1],[0,1,0],[1,0,0],[0,0,0],[0,0,0],[0,0,0]],
+    ':': [[0],[0],[1],[0],[0],[1],[0],[0]]
+}
+
+def draw_pixel_string(surface, text, start_x, start_y, char_color):
+    current_x = start_x
+    for char in text:
+        if char not in FONT: continue
+        glyph = FONT[char]
+        char_width = len(glyph[0])
+        for row_idx in range(len(glyph)):
+            for col_idx in range(len(glyph[row_idx])):
+                if glyph[row_idx][col_idx] == 1:
+                    color = GRAY if char in ['/', ':'] else char_color
+                    surface.set_at((current_x + col_idx, start_y + row_idx), color)
+        current_x += char_width
+    return current_x
+
+def main():
+    pygame.init()
+    SCALE, V_WIDTH, V_HEIGHT = 10, 64, 8
+    virtual_screen = pygame.Surface((V_WIDTH, V_HEIGHT))
+    display_screen = pygame.display.set_mode((V_WIDTH * SCALE, V_HEIGHT * SCALE))
+    pygame.display.set_caption("64x8 Pixel Micro Clock")
+    clock = pygame.time.Clock()
+    forced_icon_idx = None
+    if len(sys.argv) > 1:
+        try:
+            val = int(sys.argv[1])
+            if 0 <= val <= 6: forced_icon_idx = val
+        except ValueError: pass
+    while True:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT: pygame.quit(); sys.exit()
+        virtual_screen.fill(BG_COLOR)
+        now = datetime.now()
+        icon_data = ICONS[forced_icon_idx if forced_icon_idx is not None else (now.weekday() + 1) % 7]
+        date_str = now.strftime("%m/%d")
+        time_str = now.strftime("%H:%M:%S")
+        start_x = 0
+        next_x = draw_pixel_string(virtual_screen, date_str, start_x, 0, WHITE)
+        for r, row in enumerate(icon_data["pixels"]):
+            for c, p_val in enumerate(row):
+                if p_val > 0: virtual_screen.set_at((next_x + c, r + 1), icon_data["palette"][p_val])
+        next_x += icon_data["width"]
+        draw_pixel_string(virtual_screen, time_str, next_x, 0, WHITE)
+        pygame.transform.scale(virtual_screen, (V_WIDTH * SCALE, V_HEIGHT * SCALE), display_screen)
+        pygame.display.flip()
+        clock.tick(10)
+if __name__ == "__main__": main()
